@@ -96,11 +96,8 @@ State variables
         emit OwnershipTransferred(previousOwner, newOwner);
     }
     
-    // Fallback function to receive ETH
-    receive() external payable {
-        tokenBalances[address(0)] += msg.value;
-    }
-}
+    End
+// 
 // 
 End
 // 
