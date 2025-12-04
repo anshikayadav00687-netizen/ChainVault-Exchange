@@ -1,89 +1,140 @@
--------------------------------------------------------
-    -------------------------------------------------------
-    struct Vault {
-        address token0;
-        address token1;
-        uint256 reserve0;
-        uint256 reserve1;
-        uint256 totalShares;
-        mapping(address => uint256) shares;
-    }
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
 
-    STATE
-    0.30% swap fee
-    uint256 public constant BPS_DIVISOR = 10_000;
+/**
+ * @title ChainVault Exchange
+ * @notice A decentralized exchange (DEX) with vault-secured liquidity pools.
+ * @dev Supports ERC20 token pair swapping, liquidity adding/removal, and fee distribution.
+ */
 
-    address public owner;
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
 
-    EVENTS
-    -------------------------------------------------------
-    -------------------------------------------------------
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
+contract ChainVaultExchange {
+    address public admin;
+    IERC20 public tokenA;
+    IERC20 public tokenB;
+
+    uint256 public reserveA;
+    uint256 public reserveB;
+
+    uint256 public swapFee = 25; // 0.25% (fee = swapFee / 10000)
+
+    mapping(address => uint256) public liquidityShares;
+    uint256 public totalShares;
+
+    event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 shares);
+    event LiquidityRemoved(address indexed provider, uint256 amountA, uint256 amountB);
+    event Swapped(address indexed trader, address tokenIn, uint256 amountIn, uint256 amountOut);
+    event UpdatedFee(uint256 newFee);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Not authorized");
         _;
     }
 
-    CONSTRUCTOR
-    -------------------------------------------------------
-    -------------------------------------------------------
-    function createVault(address token0, address token1) external onlyOwner returns (uint256) {
-        require(token0 != token1, "Same token");
-
-        vaultCount++;
-        Vault storage v = vaults[vaultCount];
-        v.token0 = token0;
-        v.token1 = token1;
-
-        emit VaultCreated(vaultCount, token0, token1);
-        return vaultCount;
+    constructor(address _tokenA, address _tokenB) {
+        tokenA = IERC20(_tokenA);
+        tokenB = IERC20(_tokenB);
+        admin = msg.sender;
     }
 
-    LIQUIDITY ADDITION
-    -------------------------------------------------------
-    -------------------------------------------------------
-    function removeLiquidity(uint256 vaultId, uint256 shares) external returns (uint256 amount0, uint256 amount1) {
-        Vault storage v = vaults[vaultId];
+    /**
+     * @notice Add liquidity to vault to enable swapping
+     */
+    function addLiquidity(uint256 amountA, uint256 amountB) external {
+        require(amountA > 0 && amountB > 0, "Invalid amounts");
 
-        require(v.shares[msg.sender] >= shares, "Not enough shares");
+        tokenA.transferFrom(msg.sender, address(this), amountA);
+        tokenB.transferFrom(msg.sender, address(this), amountB);
 
-        amount0 = (shares * v.reserve0) / v.totalShares;
-        amount1 = (shares * v.reserve1) / v.totalShares;
+        uint256 shares;
+        if (totalShares == 0) {
+            shares = amountA + amountB;
+        } else {
+            shares = (amountA * totalShares) / reserveA;
+        }
 
-        v.shares[msg.sender] -= shares;
-        v.totalShares -= shares;
+        liquidityShares[msg.sender] += shares;
+        totalShares += shares;
 
-        v.reserve0 -= amount0;
-        v.reserve1 -= amount1;
+        reserveA += amountA;
+        reserveB += amountB;
 
-        IERC20(v.token0).transfer(msg.sender, amount0);
-        IERC20(v.token1).transfer(msg.sender, amount1);
-
-        emit LiquidityRemoved(vaultId, msg.sender, amount0, amount1, shares);
+        emit LiquidityAdded(msg.sender, amountA, amountB, shares);
     }
 
-    SWAPS (Constant Product AMM: x * y = k)
-    Constant-product formula
-        amountOut = (reserveOut * amountInAfterFee) / (reserveIn + amountInAfterFee);
+    /**
+     * @notice Swap Token A → Token B or Token B → Token A
+     */
+    function swap(address tokenIn, uint256 amountIn) external returns (uint256 amountOut) {
+        require(amountIn > 0, "Amount must be > 0");
 
-        require(amountOut > 0, "Insufficient output");
+        bool isAtoB = tokenIn == address(tokenA);
+        require(isAtoB || tokenIn == address(tokenB), "Invalid token");
 
-        -------------------------------------------------------
-    -------------------------------------------------------
-    function getShares(uint256 vaultId, address user) external view returns (uint256) {
-        return vaults[vaultId].shares[user];
+        if (isAtoB) {
+            tokenA.transferFrom(msg.sender, address(this), amountIn);
+            uint256 amountAfterFee = amountIn - ((amountIn * swapFee) / 10000);
+            amountOut = getPrice(amountAfterFee, reserveA, reserveB);
+
+            reserveA += amountIn;
+            reserveB -= amountOut;
+            tokenB.transfer(msg.sender, amountOut);
+
+            emit Swapped(msg.sender, tokenIn, amountIn, amountOut);
+        } else {
+            tokenB.transferFrom(msg.sender, address(this), amountIn);
+            uint256 amountAfterFee = amountIn - ((amountIn * swapFee) / 10000);
+            amountOut = getPrice(amountAfterFee, reserveB, reserveA);
+
+            reserveB += amountIn;
+            reserveA -= amountOut;
+            tokenA.transfer(msg.sender, amountOut);
+
+            emit Swapped(msg.sender, tokenIn, amountIn, amountOut);
+        }
     }
 
-    function getReserves(uint256 vaultId) external view returns (uint256 r0, uint256 r1) {
-        Vault storage v = vaults[vaultId];
-        return (v.reserve0, v.reserve1);
+    /**
+     * @notice Remove liquidity from vault and receive both tokens
+     */
+    function removeLiquidity(uint256 shares) external {
+        require(liquidityShares[msg.sender] >= shares, "Insufficient shares");
+
+        uint256 amountA = (shares * reserveA) / totalShares;
+        uint256 amountB = (shares * reserveB) / totalShares;
+
+        liquidityShares[msg.sender] -= shares;
+        totalShares -= shares;
+
+        reserveA -= amountA;
+        reserveB -= amountB;
+
+        tokenA.transfer(msg.sender, amountA);
+        tokenB.transfer(msg.sender, amountB);
+
+        emit LiquidityRemoved(msg.sender, amountA, amountB);
     }
 
-    ADMIN
-    // -------------------------------------------------------
-    function transferOwnership(address newOwner) external onlyOwner {
-        owner = newOwner;
+    /**
+     * @notice Constant-product pricing model (x * y = k)
+     */
+    function getPrice(uint256 amountIn, uint256 rIn, uint256 rOut) public pure returns (uint256) {
+        uint256 numerator = amountIn * rOut;
+        uint256 denominator = rIn + amountIn;
+        return numerator / denominator;
+    }
+
+    /**
+     * @notice Admin can update swap fee
+     */
+    function updateSwapFee(uint256 newFee) external onlyAdmin {
+        require(newFee <= 100, "Fee too high");
+        swapFee = newFee;
+        emit UpdatedFee(newFee);
     }
 }
-// 
-Contract End
-// 
